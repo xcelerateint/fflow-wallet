@@ -5,7 +5,7 @@ on:
     types: [labeled]
 
 concurrency:
-  group: ai-plan-${{ github.repository }}
+  group: ai-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
@@ -39,7 +39,6 @@ jobs:
 
       - name: Gather repo context
         run: |
-          # File tree for Claude's context (exclude noise)
           find . -type f \
             -not -path './.git/*' \
             -not -path './node_modules/*' \
@@ -66,7 +65,6 @@ jobs:
           ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body -q '.body')
           FILE_TREE=$(cat /tmp/file_tree.txt)
 
-          # Read AGENTS.md if present
           AGENTS_CONTEXT=""
           if [ -f AGENTS.md ]; then
             AGENTS_CONTEXT=$(cat AGENTS.md)
@@ -77,37 +75,82 @@ jobs:
           PLAN=""
           CRITIQUE=""
 
+          # ── API call with retry + exponential backoff ──
+          api_call_with_retry() {
+            local url="$1"
+            shift
+            local max_retries=3
+            local delay=5
+            for attempt in $(seq 1 $max_retries); do
+              local response
+              if response=$(curl -sf --max-time 120 "$url" "$@" 2>/dev/null); then
+                echo "$response"
+                return 0
+              fi
+              if [ "$attempt" -lt "$max_retries" ]; then
+                echo "API call failed (attempt $attempt/$max_retries), retrying in ${delay}s..." >&2
+                sleep "$delay"
+                delay=$((delay * 2))
+              fi
+            done
+            echo ""
+            return 1
+          }
+
           call_claude() {
             local prompt="$1"
+            local payload
+            payload=$(jq -n --arg content "$prompt" '{
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 4096,
+              "messages": [{"role": "user", "content": $content}]
+            }')
             local response
-            response=$(curl -sf https://api.anthropic.com/v1/messages \
+            response=$(api_call_with_retry "https://api.anthropic.com/v1/messages" \
               -H "x-api-key: $ANTHROPIC_API_KEY" \
               -H "anthropic-version: 2023-06-01" \
               -H "content-type: application/json" \
-              -d "$(jq -n \
-                --arg content "$prompt" \
-                '{
-                  "model": "claude-sonnet-4-20250514",
-                  "max_tokens": 4096,
-                  "messages": [{"role": "user", "content": $content}]
-                }')")
+              -d "$payload")
             echo "$response" | jq -r '.content[0].text // empty'
           }
 
           call_codex() {
             local prompt="$1"
+            local payload
+            payload=$(jq -n --arg content "$prompt" '{
+              "model": "gpt-4o",
+              "max_tokens": 4096,
+              "messages": [{"role": "user", "content": $content}]
+            }')
             local response
-            response=$(curl -sf https://api.openai.com/v1/chat/completions \
+            response=$(api_call_with_retry "https://api.openai.com/v1/chat/completions" \
               -H "Authorization: Bearer $OPENAI_API_KEY" \
               -H "content-type: application/json" \
-              -d "$(jq -n \
-                --arg content "$prompt" \
-                '{
-                  "model": "gpt-4o",
-                  "max_tokens": 4096,
-                  "messages": [{"role": "user", "content": $content}]
-                }')")
+              -d "$payload")
             echo "$response" | jq -r '.choices[0].message.content // empty'
+          }
+
+          # ── Robust APPROVE/REJECT parser ──
+          # Handles: whitespace, markdown formatting, code blocks, quoted replies
+          parse_verdict() {
+            local text="$1"
+            # Strip markdown formatting, code blocks, quoted lines, leading whitespace
+            local cleaned
+            cleaned=$(echo "$text" | \
+              sed 's/^> .*//' | \
+              sed 's/^```.*$//' | \
+              sed 's/\*\*//g' | \
+              sed 's/^[[:space:]]*//' | \
+              tr -s '[:space:]')
+            # Get first non-empty word, uppercase
+            local first_word
+            first_word=$(echo "$cleaned" | awk 'NF{print toupper($1); exit}')
+            # Normalize common variants
+            case "$first_word" in
+              APPROVE|APPROVED|LGTM) echo "APPROVE" ;;
+              REJECT|REJECTED)       echo "REJECT" ;;
+              *)                     echo "UNKNOWN" ;;
+            esac
           }
 
           while [ "$ITERATION" -lt "$MAX_ITERATIONS" ] && [ "$APPROVED" != "true" ]; do
@@ -226,19 +269,25 @@ jobs:
 
           ${CRITIQUE}"
 
-            # Check for approval (first non-empty word must be APPROVE)
-            FIRST_WORD=$(echo "$CRITIQUE" | awk 'NF{print toupper($1); exit}')
-            if [ "$FIRST_WORD" = "APPROVE" ]; then
+            # Check verdict with robust parser
+            VERDICT=$(parse_verdict "$CRITIQUE")
+            echo "Parsed verdict: $VERDICT"
+            if [ "$VERDICT" = "APPROVE" ]; then
               APPROVED=true
               echo "Plan approved on iteration $ITERATION"
             else
-              echo "Plan not approved, will revise"
+              echo "Plan not approved ($VERDICT), will revise"
             fi
           done
 
           if [ "$APPROVED" = "true" ]; then
-            # Inject issue number into plan for traceability
-            FINAL_PLAN=$(echo "$PLAN" | jq --argjson num "$ISSUE_NUMBER" '. + {issue_number: $num}')
+            # Inject issue number and metadata for traceability
+            FINAL_PLAN=$(echo "$PLAN" | jq \
+              --argjson num "$ISSUE_NUMBER" \
+              --arg repo "$REPO" \
+              --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --argjson iter "$ITERATION" \
+              '. + {issue_number: $num, repository: $repo, locked_at: $ts, iterations: $iter}')
             echo "$FINAL_PLAN" > /tmp/plan.json
             echo "approved=true" >> "$GITHUB_OUTPUT"
           else
@@ -335,3 +384,22 @@ jobs:
           \`\`\`
 
           </details>"
+
+      # ── Audit: upload plan and workflow metadata as artifact ──
+      - name: Save audit trail
+        if: always()
+        run: |
+          mkdir -p /tmp/audit
+          echo "${{ github.event.issue.number }}" > /tmp/audit/issue_number.txt
+          echo "${{ github.run_id }}" > /tmp/audit/workflow_run_id.txt
+          echo "${{ github.repository }}" > /tmp/audit/repository.txt
+          date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/audit/timestamp.txt
+          cp /tmp/plan.json /tmp/audit/plan.locked.json 2>/dev/null || echo '{"error":"no plan produced"}' > /tmp/audit/plan.locked.json
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-plan-audit-${{ github.event.issue.number }}
+          path: /tmp/audit/
+          retention-days: 90

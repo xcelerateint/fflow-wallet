@@ -3,5 +3,6 @@
   "max_plan_iterations": 3,
   "require_tests": true,
   "auto_merge": false,
+  "high_risk": true,
   "risk_tier": "high"
 }

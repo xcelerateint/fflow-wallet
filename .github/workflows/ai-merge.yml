@@ -27,9 +27,12 @@ jobs:
         run: |
           if [ -f .ai/config.json ]; then
             echo "auto_merge=$(jq -r '.auto_merge // false' .ai/config.json)" >> "$GITHUB_OUTPUT"
+            echo "high_risk=$(jq -r '.high_risk // false' .ai/config.json)" >> "$GITHUB_OUTPUT"
             echo "risk_tier=$(jq -r '.risk_tier // "standard"' .ai/config.json)" >> "$GITHUB_OUTPUT"
           else
+            # Default: assume high risk if no config exists
             echo "auto_merge=false" >> "$GITHUB_OUTPUT"
+            echo "high_risk=true" >> "$GITHUB_OUTPUT"
             echo "risk_tier=high" >> "$GITHUB_OUTPUT"
           fi
 
@@ -47,9 +50,90 @@ jobs:
           echo "Waiting for CI checks on PR #${{ github.event.pull_request.number }}..."
           gh pr checks "${{ github.event.pull_request.number }}" --watch --fail-fast
 
-      # ── Auto-merge for standard-risk repos ──
-      - name: Auto-merge
-        if: steps.config.outputs.auto_merge == 'true'
+      # ══════════════════════════════════════════════════
+      # HIGH-RISK REPOS: NEVER auto-merge. Period.
+      # ══════════════════════════════════════════════════
+      - name: "HIGH RISK: Enforce human-reviewed label"
+        if: steps.config.outputs.high_risk == 'true'
+        id: label_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
+
+          if echo "$LABELS" | grep -qx "human-reviewed"; then
+            echo "has_label=true" >> "$GITHUB_OUTPUT"
+            echo "Label 'human-reviewed' found on PR #$PR_NUMBER"
+          else
+            echo "has_label=false" >> "$GITHUB_OUTPUT"
+            echo "Label 'human-reviewed' NOT found on PR #$PR_NUMBER"
+          fi
+
+      - name: "HIGH RISK: Block merge without human-reviewed label"
+        if: >
+          steps.config.outputs.high_risk == 'true' &&
+          steps.label_check.outputs.has_label != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.extract.outputs.issue_number }}
+          RISK_TIER: ${{ steps.config.outputs.risk_tier }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          gh pr comment "$PR_NUMBER" \
+            --body "## Human Approval Required
+
+          **AI consensus is complete.** All checks pass and Claude has approved this implementation.
+
+          | Gate | Status |
+          |------|--------|
+          | Scope check | Passed |
+          | Tests | Passed |
+          | Claude review | Approved |
+          | Risk tier | \`${RISK_TIER}\` |
+          | Auto-merge | **Disabled (high-risk repo)** |
+          | \`human-reviewed\` label | **Missing — merge blocked** |
+
+          ### To merge this PR:
+          1. Review the code changes and the AI review packet above
+          2. Add the \`human-reviewed\` label to this PR
+          3. Approve and merge manually
+
+          > **This repo is classified as high-risk.** Automation will never merge code here. Two human approving reviews are required by branch protection."
+
+          gh issue edit "$ISSUE_NUMBER" --add-label "approved" --remove-label "implementing"
+
+      - name: "HIGH RISK: Confirm human gate (label present)"
+        if: >
+          steps.config.outputs.high_risk == 'true' &&
+          steps.label_check.outputs.has_label == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.extract.outputs.issue_number }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          gh pr comment "$PR_NUMBER" \
+            --body "## Ready for Human Merge
+
+          **AI consensus complete. \`human-reviewed\` label confirmed.**
+
+          This PR is ready for manual merge by a human reviewer.
+          Automation will NOT merge this PR — a human must click merge."
+
+          gh issue edit "$ISSUE_NUMBER" --add-label "approved" --remove-label "implementing"
+
+          # EXPLICIT: Do NOT call gh pr merge. Ever. For high-risk repos.
+          echo "HIGH RISK: Merge blocked by policy. Human must merge manually."
+
+      # ══════════════════════════════════════════════════
+      # STANDARD-RISK REPOS: Auto-merge allowed
+      # ══════════════════════════════════════════════════
+      - name: "STANDARD: Auto-merge"
+        if: >
+          steps.config.outputs.high_risk != 'true' &&
+          steps.config.outputs.auto_merge == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ steps.extract.outputs.issue_number }}
@@ -65,9 +149,10 @@ jobs:
 
           gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/${BRANCH}" 2>/dev/null || true
 
-      # ── Human approval required for high-risk repos ──
-      - name: Request human approval
-        if: steps.config.outputs.auto_merge != 'true'
+      - name: "STANDARD: Request human approval (auto_merge disabled)"
+        if: >
+          steps.config.outputs.high_risk != 'true' &&
+          steps.config.outputs.auto_merge != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ steps.extract.outputs.issue_number }}

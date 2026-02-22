@@ -171,8 +171,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Claude reviews PR
-        id: review
+      - name: Read AI config
+        id: config
+        run: |
+          if [ -f .ai/config.json ]; then
+            echo "high_risk=$(jq -r '.high_risk // false' .ai/config.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "high_risk=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Claude reviews PR (standard repos)
+        if: steps.config.outputs.high_risk != 'true'
+        id: review_standard
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -186,6 +196,61 @@ jobs:
             4. Code quality is acceptable (no obvious bugs, security issues, or regressions)
 
             If the implementation correctly follows the plan, approve the PR with a brief summary.
+            If there are deviations that need fixing, request specific changes.
+            If there are security risks or consensus-breaking changes, include the word HALT in your review.
+
+      - name: Claude reviews PR + generates review packet (high-risk repos)
+        if: steps.config.outputs.high_risk == 'true'
+        id: review_high_risk
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          direct_prompt: |
+            You are reviewing a PR on a HIGH-RISK repository (blockchain/consensus-critical code).
+            This PR will be reviewed by human engineers. Your job is to prepare a structured review packet.
+
+            Read the approved plan in .ai/plan.locked.json and review the PR diff.
+
+            ## Part 1: Plan Compliance Review
+
+            Verify:
+            1. Logic matches plan intent — each change in the plan is implemented correctly
+            2. No scope creep beyond allowed files
+            3. Invariants listed in the plan are preserved
+            4. Code quality is acceptable (no obvious bugs, security issues, or regressions)
+
+            ## Part 2: Human Review Packet
+
+            Generate a structured review report in this EXACT format:
+
+            ---
+            ### AI Review Packet for Human Reviewers
+
+            **Change Impact Summary:**
+            - [1-3 bullet points: what this change does in plain English]
+
+            **Files Modified:**
+            | File | Lines Changed | Risk |
+            |------|--------------|------|
+            | [file] | +N / -N | low/medium/high |
+
+            **Behavioral Changes:**
+            - [List any changes to: consensus rules, transaction validation, RPC behavior, P2P protocol, wallet operations]
+            - If none: "No behavioral changes to consensus or protocol"
+
+            **Risk Classification:** [LOW / MEDIUM / HIGH / CRITICAL]
+            - [1-2 sentences justifying the risk level]
+
+            **Invariants Verified:**
+            - [List each invariant from the plan and whether it holds]
+
+            **Potential Regressions:**
+            - [List anything that could break, or "None identified"]
+
+            **Recommendation:** [APPROVE / REQUEST CHANGES / HALT]
+            ---
+
+            If the implementation correctly follows the plan and your recommendation is APPROVE, approve the PR.
             If there are deviations that need fixing, request specific changes.
             If there are security risks or consensus-breaking changes, include the word HALT in your review.
 

@@ -1,0 +1,234 @@
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  issues: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ── Deterministic scope check (no AI) ──
+  scope-check:
+    if: startsWith(github.head_ref, 'ai/issue-')
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.extract.outputs.issue_number }}
+      passed: ${{ steps.check.outputs.passed }}
+    steps:
+      - name: Extract issue number from branch
+        id: extract
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          ISSUE_NUM="${BRANCH#ai/issue-}"
+          echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout base branch (has locked plan)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+
+      - name: Read locked plan
+        id: plan
+        run: |
+          if [ ! -f .ai/plan.locked.json ]; then
+            echo "ERROR: No locked plan found on base branch (${{ github.base_ref }})"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # Verify plan matches this issue
+          PLAN_ISSUE=$(jq -r '.issue_number // empty' .ai/plan.locked.json)
+          EXPECTED="${{ steps.extract.outputs.issue_number }}"
+          if [ -n "$PLAN_ISSUE" ] && [ "$PLAN_ISSUE" != "$EXPECTED" ]; then
+            echo "ERROR: Locked plan is for issue #$PLAN_ISSUE, expected #$EXPECTED"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          jq -r '.files_allowed[]' .ai/plan.locked.json | sort > /tmp/allowed_files.txt
+          echo "Allowed files:"
+          cat /tmp/allowed_files.txt
+
+      - name: Get changed files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff "${{ github.event.pull_request.number }}" --name-only | sort > /tmp/changed_files.txt
+          echo "Changed files:"
+          cat /tmp/changed_files.txt
+
+      - name: Compare scope
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.extract.outputs.issue_number }}
+        run: |
+          VIOLATIONS=""
+          while IFS= read -r file; do
+            if [ -z "$file" ]; then continue; fi
+            if ! grep -qxF "$file" /tmp/allowed_files.txt; then
+              VIOLATIONS="${VIOLATIONS}- \`${file}\`
+          "
+            fi
+          done < /tmp/changed_files.txt
+
+          if [ -n "$VIOLATIONS" ]; then
+            gh pr comment "${{ github.event.pull_request.number }}" \
+              --body "**SCOPE VIOLATION:** The following files are not in the approved plan:
+
+          ${VIOLATIONS}
+          PR blocked. These files must be added to the plan or the changes removed."
+
+            gh issue edit "$ISSUE_NUMBER" --add-label "halted"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "All changed files are within approved scope"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Execute required tests (no AI) ──
+  run-tests:
+    needs: scope-check
+    if: needs.scope-check.outputs.passed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.run.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; fi
+          if [ -f yarn.lock ]; then yarn install --frozen-lockfile; fi
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile; fi
+
+      - name: Read test commands from plan
+        id: tests
+        run: |
+          # Read from base branch plan
+          git fetch origin "${{ github.base_ref }}"
+          git checkout "origin/${{ github.base_ref }}" -- .ai/plan.locked.json
+          jq -r '.tests_required[].command' .ai/plan.locked.json > /tmp/test_commands.txt
+          echo "Test commands:"
+          cat /tmp/test_commands.txt
+
+      - name: Run tests
+        id: run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FAILED=false
+          while IFS= read -r cmd; do
+            if [ -z "$cmd" ]; then continue; fi
+            echo "========================================="
+            echo "Running: $cmd"
+            echo "========================================="
+            if OUTPUT=$(eval "$cmd" 2>&1); then
+              echo "PASSED: $cmd"
+            else
+              FAILED=true
+              gh pr comment "${{ github.event.pull_request.number }}" \
+                --body "**Test Failed:** \`$cmd\`
+
+          <details><summary>Output</summary>
+
+          \`\`\`
+          $OUTPUT
+          \`\`\`
+
+          </details>"
+            fi
+          done < /tmp/test_commands.txt
+
+          if [ "$FAILED" = "true" ]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Claude logic review (only if scope + tests pass) ──
+  claude-review:
+    needs: [scope-check, run-tests]
+    if: >
+      needs.scope-check.outputs.passed == 'true' &&
+      needs.run-tests.outputs.passed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Claude reviews PR
+        id: review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          direct_prompt: |
+            Review this PR against the approved plan in .ai/plan.locked.json.
+
+            Verify:
+            1. Logic matches plan intent — each change in the plan is implemented correctly
+            2. No scope creep beyond allowed files
+            3. Invariants listed in the plan are preserved
+            4. Code quality is acceptable (no obvious bugs, security issues, or regressions)
+
+            If the implementation correctly follows the plan, approve the PR with a brief summary.
+            If there are deviations that need fixing, request specific changes.
+            If there are security risks or consensus-breaking changes, include the word HALT in your review.
+
+      - name: Process review result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.scope-check.outputs.issue_number }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # Get the latest review on this PR
+          REVIEW_JSON=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" --jq '.[-1]')
+          STATE=$(echo "$REVIEW_JSON" | jq -r '.state // empty')
+          BODY=$(echo "$REVIEW_JSON" | jq -r '.body // empty')
+
+          # Also check latest comment (action may post a comment instead of a review)
+          if [ -z "$BODY" ]; then
+            BODY=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --jq '.[-1].body // empty')
+          fi
+
+          echo "Review state: $STATE"
+          echo "Review body preview: $(echo "$BODY" | head -5)"
+
+          # ── HALT: close PR, halt issue ──
+          if echo "$BODY" | grep -qiw "HALT"; then
+            echo "HALT detected — closing PR and halting issue"
+            gh pr close "$PR_NUMBER" --comment "Claude halted this implementation due to security or consensus concerns. A new issue is required to restart."
+            gh issue edit "$ISSUE_NUMBER" --add-label "halted" --remove-label "implementing"
+            gh issue comment "$ISSUE_NUMBER" --body "Claude halted implementation on PR #${PR_NUMBER}. Review the PR comments for details. A new issue is required to restart."
+            exit 0
+          fi
+
+          # ── CHANGES REQUESTED: notify Codex ──
+          if [ "$STATE" = "CHANGES_REQUESTED" ]; then
+            echo "Changes requested — notifying Codex"
+            gh pr comment "$PR_NUMBER" --body "@codex Claude requested changes to your implementation. Please review the feedback above and push fixes to this branch.
+
+          Only modify files listed in \`files_allowed\` from the plan. Do not introduce new files."
+            exit 0
+          fi
+
+          # ── APPROVED: update issue label ──
+          if [ "$STATE" = "APPROVED" ]; then
+            echo "PR approved by Claude"
+            gh issue edit "$ISSUE_NUMBER" --add-label "approved" --remove-label "implementing"
+            exit 0
+          fi
+
+          echo "Review state '$STATE' not handled — no action taken"

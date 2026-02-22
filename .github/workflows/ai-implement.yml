@@ -1,0 +1,105 @@
+name: AI Implement
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  implement:
+    if: github.event.label.name == 'plan-approved'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read AI config
+        id: config
+        run: |
+          if [ -f .ai/config.json ]; then
+            echo "dev_branch=$(jq -r '.dev_branch // "main"' .ai/config.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "dev_branch=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read locked plan
+        id: plan
+        env:
+          DEV_BRANCH: ${{ steps.config.outputs.dev_branch }}
+        run: |
+          git fetch origin "$DEV_BRANCH"
+          git checkout "$DEV_BRANCH" -- .ai/plan.locked.json
+
+          if [ ! -f .ai/plan.locked.json ]; then
+            echo "ERROR: No locked plan found on $DEV_BRANCH"
+            exit 1
+          fi
+
+          # Verify plan matches this issue
+          PLAN_ISSUE=$(jq -r '.issue_number // empty' .ai/plan.locked.json)
+          if [ -n "$PLAN_ISSUE" ] && [ "$PLAN_ISSUE" != "${{ github.event.issue.number }}" ]; then
+            echo "ERROR: Locked plan is for issue #$PLAN_ISSUE, not #${{ github.event.issue.number }}"
+            exit 1
+          fi
+
+          echo "plan_exists=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create implementation branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DEV_BRANCH: ${{ steps.config.outputs.dev_branch }}
+        run: |
+          BRANCH="ai/issue-${ISSUE_NUMBER}"
+
+          git fetch origin "$DEV_BRANCH"
+          git checkout -b "$BRANCH" "origin/$DEV_BRANCH"
+          git push -u origin "$BRANCH"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Update labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" \
+            --remove-label "plan-approved" --add-label "implementing"
+
+      - name: Post implementation instruction
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DEV_BRANCH: ${{ steps.config.outputs.dev_branch }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          PLAN=$(cat .ai/plan.locked.json)
+          FILES_ALLOWED=$(echo "$PLAN" | jq -r '.files_allowed[]' | paste -sd ', ' -)
+          TESTS=$(echo "$PLAN" | jq -r '.tests_required[].command' | paste -sd ', ' -)
+          SUMMARY=$(echo "$PLAN" | jq -r '.summary')
+
+          gh issue comment "$ISSUE_NUMBER" --body "@codex Implement the locked plan on branch \`$BRANCH\`.
+
+          **Summary:** $SUMMARY
+          **Target branch:** \`$DEV_BRANCH\`
+          **Allowed files:** $FILES_ALLOWED
+          **Required tests:** $TESTS
+
+          Instructions:
+          1. Check out branch \`$BRANCH\`
+          2. Read the full plan from \`.ai/plan.locked.json\`
+          3. Implement ALL changes listed in the plan
+          4. ONLY modify files listed in \`files_allowed\`
+          5. Run all tests listed in \`tests_required\`
+          6. Create a PR from \`$BRANCH\` to \`$DEV_BRANCH\`
+
+          <details><summary>Full plan</summary>
+
+          \`\`\`json
+          $(echo "$PLAN" | jq .)
+          \`\`\`
+
+          </details>"

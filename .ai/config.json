@@ -1,0 +1,7 @@
+{
+  "dev_branch": "master",
+  "max_plan_iterations": 3,
+  "require_tests": true,
+  "auto_merge": false,
+  "risk_tier": "high"
+}

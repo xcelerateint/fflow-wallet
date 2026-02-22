@@ -1,0 +1,78 @@
+name: AI Merge
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  issues: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: >
+      github.event.review.state == 'approved' &&
+      startsWith(github.event.pull_request.head.ref, 'ai/issue-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read AI config
+        id: config
+        run: |
+          if [ -f .ai/config.json ]; then
+            echo "auto_merge=$(jq -r '.auto_merge // false' .ai/config.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "auto_merge=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract issue number
+        id: extract
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          ISSUE_NUM="${BRANCH#ai/issue-}"
+          echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for all checks to pass
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Waiting for CI checks on PR #${{ github.event.pull_request.number }}..."
+          gh pr checks "${{ github.event.pull_request.number }}" --watch --fail-fast
+
+      # ── Auto-merge for standard-risk repos ──
+      - name: Auto-merge
+        if: steps.config.outputs.auto_merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.extract.outputs.issue_number }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+
+          gh pr merge "$PR_NUMBER" --squash --auto
+          echo "Auto-merge enabled for PR #$PR_NUMBER"
+
+          # Close linked issue
+          gh issue close "$ISSUE_NUMBER" \
+            --comment "Implemented and merged via AI consensus (PR #${PR_NUMBER})."
+
+          # Clean up branch (gh pr merge --delete-branch may handle this)
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/${BRANCH}" 2>/dev/null || true
+
+      # ── Human approval required for high-risk repos ──
+      - name: Request human approval
+        if: steps.config.outputs.auto_merge != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.extract.outputs.issue_number }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          gh pr comment "$PR_NUMBER" \
+            --body "**AI consensus reached.** All checks pass and Claude has approved this implementation.
+
+          Awaiting human approval to merge. Please review and merge when ready."
+
+          gh issue edit "$ISSUE_NUMBER" --add-label "approved" --remove-label "implementing"

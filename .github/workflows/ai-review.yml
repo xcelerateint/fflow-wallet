@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+concurrency:
+  group: ai-${{ github.repository }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 permissions:
   issues: write
   contents: read
@@ -116,7 +120,6 @@ jobs:
       - name: Read test commands from plan
         id: tests
         run: |
-          # Read from base branch plan
           git fetch origin "${{ github.base_ref }}"
           git checkout "origin/${{ github.base_ref }}" -- .ai/plan.locked.json
           jq -r '.tests_required[].command' .ai/plan.locked.json > /tmp/test_commands.txt
@@ -144,7 +147,7 @@ jobs:
           <details><summary>Output</summary>
 
           \`\`\`
-          $OUTPUT
+          $(echo "$OUTPUT" | head -100)
           \`\`\`
 
           </details>"
@@ -198,7 +201,7 @@ jobs:
           STATE=$(echo "$REVIEW_JSON" | jq -r '.state // empty')
           BODY=$(echo "$REVIEW_JSON" | jq -r '.body // empty')
 
-          # Also check latest comment (action may post a comment instead of a review)
+          # Fallback: check latest comment if action posted a comment instead of review
           if [ -z "$BODY" ]; then
             BODY=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --jq '.[-1].body // empty')
           fi
@@ -232,3 +235,23 @@ jobs:
           fi
 
           echo "Review state '$STATE' not handled — no action taken"
+
+      # ── Audit: upload review metadata ──
+      - name: Save audit trail
+        if: always()
+        run: |
+          mkdir -p /tmp/audit
+          echo "${{ github.event.pull_request.number }}" > /tmp/audit/pr_number.txt
+          echo "${{ github.run_id }}" > /tmp/audit/workflow_run_id.txt
+          gh pr diff "${{ github.event.pull_request.number }}" > /tmp/audit/pr_diff.txt 2>/dev/null || true
+          cp .ai/plan.locked.json /tmp/audit/ 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-audit-pr-${{ github.event.pull_request.number }}
+          path: /tmp/audit/
+          retention-days: 90
